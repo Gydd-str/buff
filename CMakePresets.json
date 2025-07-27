@@ -1,0 +1,88 @@
+{
+    "version": 3,
+    "vendor": {
+        "qtcreator": {
+            "cmake": "/usr/bin/cmake",
+            "ninja": "/usr/bin/ninja",
+            "debugger": "C:/Qt/Tools/mingw1310_64/bin/gdb.exe",
+            "qtVersion": "6.9.1",
+            "qtInstallPath": "/opt/Qt/6.8.0/gcc_64"
+        }
+    },
+    "configurePresets": [
+        {
+            "name": "qt-default",
+            "displayName": "Qt Creator Default Kit",
+            "description": "Default configuration for Qt Creator with C++20",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_STANDARD": "20",
+                "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+                "CMAKE_CXX_EXTENSIONS": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_C_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/gcc.exe",
+                "CMAKE_CXX_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/g++.exe",
+                "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe",
+                "QT_VERSION_MAJOR": "6",
+                "CMAKE_PREFIX_PATH": "C:/Qt/6.9.1/mingw_64"
+            },
+            "environment": {
+                "Qt6_DIR": "C:/Qt/6.9.1/mingw_64/lib/cmake/Qt6",
+                "QT_PLUGIN_PATH": "C:/Qt/6.9.1/mingw_64/plugins",
+                "QML_IMPORT_PATH": "C:/Qt/6.9.1/mingw_64/qml",
+                "PATH": "C:/Qt/6.9.1/mingw_64/bin;C:/Qt/Tools/mingw1310_64/bin;$env{PATH}"
+            },
+            "toolset": {
+                "value": "host=x64",
+                "strategy": "external"
+            }
+        },
+        {
+            "name": "qt-release",
+            "displayName": "Qt Creator Release",
+            "description": "Release configuration for Qt Creator with C++20",
+            "inherits": "qt-default",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "qt-relwithdebinfo",
+            "displayName": "Qt Creator RelWithDebInfo",
+            "description": "Release with debug info for Qt Creator with C++20",
+            "inherits": "qt-default",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "qt-default-build",
+            "displayName": "Build Qt Default",
+            "configurePreset": "qt-default"
+        },
+        {
+            "name": "qt-release-build",
+            "displayName": "Build Qt Release",
+            "configurePreset": "qt-release"
+        },
+        {
+            "name": "qt-relwithdebinfo-build",
+            "displayName": "Build Qt RelWithDebInfo",
+            "configurePreset": "qt-relwithdebinfo"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "qt-default-test",
+            "displayName": "Test Qt Default",
+            "configurePreset": "qt-default",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}
