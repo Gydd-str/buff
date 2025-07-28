@@ -1,0 +1,521 @@
+#!/bin/bash
+
+# Embedded USB Analysis and Debugging Script
+# Based on embedded USB debugging best practices and kernel documentation
+
+set -e
+
+ANALYSIS_DIR="/tmp/usb_embedded_analysis_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$ANALYSIS_DIR"
+cd "$ANALYSIS_DIR"
+
+echo "=== Embedded USB Analysis Script ==="
+echo "Analysis directory: $ANALYSIS_DIR"
+echo "Based on usbmon and embedded debugging techniques"
+
+# ============================================================================
+# SETUP AND PREREQUISITES
+# ============================================================================
+
+setup_usbmon() {
+    echo "=== Setting up USB monitoring infrastructure ==="
+    
+    # Load usbmon module
+    if ! lsmod | grep -q usbmon; then
+        echo "Loading usbmon module..."
+        modprobe usbmon || echo "Failed to load usbmon - may be built-in"
+    fi
+    
+    # Mount debugfs if not mounted
+    if ! mount | grep -q debugfs; then
+        echo "Mounting debugfs..."
+        mount -t debugfs none /sys/kernel/debug 2>/dev/null || echo "debugfs already mounted or failed"
+    fi
+    
+    # Check usbmon availability
+    if [ -d /sys/kernel/debug/usb/usbmon ]; then
+        echo "usbmon available at /sys/kernel/debug/usb/usbmon"
+        ls -la /sys/kernel/debug/usb/usbmon/
+    else
+        echo "ERROR: usbmon not available"
+        echo "Please ensure:"
+        echo "1. CONFIG_USB_MON is enabled in kernel"
+        echo "2. debugfs is mounted: mount -t debugfs none /sys/kernel/debug"
+        exit 1
+    fi
+}
+
+# ============================================================================
+# USB CONTROLLER AND SYSTEM ANALYSIS
+# ============================================================================
+
+analyze_usb_controller() {
+    echo "=== USB Controller Analysis ==="
+    
+    echo "--- PCI USB Controllers ---"
+    lspci -v | grep -A15 -i usb > controller_info.txt
+    cat controller_info.txt
+    
+    echo -e "\n--- USB Controller Drivers ---"
+    lsmod | grep -E "(ehci|ohci|xhci|dwc|musb|chipidea)" > controller_modules.txt
+    cat controller_modules.txt
+    
+    echo -e "\n--- USB Controller IRQs ---"
+    cat /proc/interrupts | grep -i -E "(usb|ehci|ohci|xhci|dwc)" > controller_irqs.txt
+    cat controller_irqs.txt
+    
+    echo -e "\n--- USB Power Management ---"
+    find /sys -name "*usb*" -name "power" -type d 2>/dev/null | head -10 | while read powerdir; do
+        echo "=== $powerdir ==="
+        for file in autosuspend_delay_ms level control runtime_status; do
+            if [ -f "$powerdir/$file" ]; then
+                echo "$file: $(cat $powerdir/$file 2>/dev/null || echo 'N/A')"
+            fi
+        done
+        echo ""
+    done > usb_power_management.txt
+    
+    cat usb_power_management.txt
+}
+
+# ============================================================================
+# REAL-TIME USB MONITORING FUNCTIONS
+# ============================================================================
+
+start_comprehensive_monitoring() {
+    echo "=== Starting Comprehensive USB Monitoring ==="
+    
+    mkdir -p {logs,traces,snapshots}
+    
+    # 1. usbmon raw monitoring (all buses)
+    echo "Starting usbmon monitoring..."
+    cat /sys/kernel/debug/usb/usbmon/0u > traces/usbmon_all_buses.raw &
+    USBMON_PID=$!
+    
+    # 2. Individual bus monitoring
+    for bus in /sys/kernel/debug/usb/usbmon/[1-9]u; do
+        if [ -r "$bus" ]; then
+            bus_num=$(basename "$bus" | tr -d 'u')
+            cat "$bus" > "traces/usbmon_bus${bus_num}.raw" &
+        fi
+    done
+    
+    # 3. Interrupt monitoring with timestamps
+    (while true; do
+        echo "$(date '+%H:%M:%S.%3N'): $(cat /proc/interrupts | grep -i -E '(usb|ehci|ohci|xhci|dwc)' | wc -l) USB IRQ lines"
+        cat /proc/interrupts | grep -i -E "(usb|ehci|ohci|xhci|dwc)" | \
+        awk -v ts="$(date '+%H:%M:%S.%3N')" '{print ts ": " $0}'
+        echo "---"
+        sleep 0.1
+    done) > logs/interrupt_monitoring.log &
+    IRQ_MON_PID=$!
+    
+    # 4. Process state monitoring (focus on D state)
+    (while true; do
+        BLOCKED_COUNT=$(ps aux | awk '$8 ~ /D/ {print $0}' | wc -l)
+        if [ $BLOCKED_COUNT -gt 0 ]; then
+            echo "=== $(date '+%H:%M:%S.%3N') - $BLOCKED_COUNT blocked processes ==="
+            ps aux | awk '$8 ~ /D/ {print $0}'
+            echo ""
+        fi
+        sleep 0.1
+    done) > logs/blocked_processes.log &
+    PROC_MON_PID=$!
+    
+    # 5. USB device enumeration monitoring
+    (while true; do
+        echo "=== $(date '+%H:%M:%S.%3N') ==="
+        lsusb | wc -l | xargs echo "USB devices:"
+        lsusb
+        echo ""
+        sleep 0.5
+    done) > logs/usb_enumeration.log &
+    ENUM_PID=$!
+    
+    # 6. udev event monitoring
+    udevadm monitor --timestamp --property --subsystem-match=usb > logs/udev_usb_events.log &
+    UDEV_PID=$!
+    
+    # 7. Kernel message monitoring
+    dmesg -w > logs/kernel_messages.log &
+    DMESG_PID=$!
+    
+    # 8. System load monitoring (high frequency)
+    (while true; do
+        echo "$(date '+%H:%M:%S.%3N'): $(cat /proc/loadavg)"
+        sleep 0.05
+    done) > logs/system_load.log &
+    LOAD_PID=$!
+    
+    # Store PIDs for cleanup
+    echo "$USBMON_PID $IRQ_MON_PID $PROC_MON_PID $ENUM_PID $UDEV_PID $DMESG_PID $LOAD_PID" > monitor_pids.txt
+    
+    echo "All monitoring started. PIDs: $(cat monitor_pids.txt)"
+}
+
+stop_monitoring() {
+    echo "=== Stopping all monitoring ==="
+    if [ -f monitor_pids.txt ]; then
+        for pid in $(cat monitor_pids.txt); do
+            kill $pid 2>/dev/null || true
+        done
+        # Also kill any remaining usbmon processes
+        pkill -f "cat /sys/kernel/debug/usb/usbmon" 2>/dev/null || true
+    fi
+    echo "Monitoring stopped"
+}
+
+# ============================================================================
+# USB INSERTION TEST PROTOCOL
+# ============================================================================
+
+usb_insertion_test() {
+    echo "=== USB Insertion Test Protocol ==="
+    
+    # Take baseline snapshots
+    echo "Taking baseline snapshots..."
+    cat /proc/interrupts > snapshots/interrupts_before.txt
+    cat /proc/meminfo > snapshots/meminfo_before.txt
+    ps aux > snapshots/processes_before.txt
+    lsusb > snapshots/lsusb_before.txt 2>/dev/null || echo "lsusb failed" > snapshots/lsusb_before.txt
+    
+    echo ""
+    echo "=========================================="
+    echo "   USB INSERTION TEST READY"
+    echo "=========================================="
+    echo ""
+    echo "Current monitoring active:"
+    echo "- Raw USB bus transactions (usbmon)"
+    echo "- Interrupt rates and conflicts"
+    echo "- Process blocking (D state)"
+    echo "- USB device enumeration"
+    echo "- udev events"
+    echo "- Kernel messages"
+    echo "- System load"
+    echo ""
+    echo "INSTRUCTIONS:"
+    echo "1. Wait 5 seconds for baseline data"
+    echo "2. Plug in your USB device when prompted"
+    echo "3. Press ENTER after the freeze/stall ends"
+    echo ""
+    
+    # Collect baseline for 5 seconds
+    echo "Collecting baseline data for 5 seconds..."
+    sleep 5
+    
+    # Mark insertion time
+    date '+%H:%M:%S.%3N' > timestamps/insertion_time.txt
+    echo ""
+    echo ">>> PLUG IN USB DEVICE NOW <<<"
+    echo ""
+    
+    # Wait for user to indicate completion
+    read -p "Press ENTER when the freeze is over: " dummy
+    
+    # Mark completion time
+    date '+%H:%M:%S.%3N' > timestamps/completion_time.txt
+    
+    # Take post-insertion snapshots
+    echo "Taking post-insertion snapshots..."
+    cat /proc/interrupts > snapshots/interrupts_after.txt
+    cat /proc/meminfo > snapshots/meminfo_after.txt
+    ps aux > snapshots/processes_after.txt
+    lsusb > snapshots/lsusb_after.txt 2>/dev/null || echo "lsusb failed" > snapshots/lsusb_after.txt
+    
+    # Continue monitoring for analysis
+    echo "Continuing monitoring for 10 more seconds..."
+    sleep 10
+}
+
+# ============================================================================
+# ANALYSIS FUNCTIONS
+# ============================================================================
+
+analyze_results() {
+    echo "=== Analyzing Results ==="
+    
+    mkdir -p analysis
+    
+    # 1. Interrupt analysis
+    echo "--- Interrupt Analysis ---"
+    if [ -f snapshots/interrupts_before.txt ] && [ -f snapshots/interrupts_after.txt ]; then
+        echo "IRQ count differences:" > analysis/interrupt_analysis.txt
+        diff -u snapshots/interrupts_before.txt snapshots/interrupts_after.txt >> analysis/interrupt_analysis.txt || true
+        
+        echo "USB-specific IRQ changes:" >> analysis/interrupt_analysis.txt
+        grep -E "(usb|ehci|ohci|xhci|dwc)" snapshots/interrupts_before.txt > /tmp/usb_irq_before.tmp 2>/dev/null || true
+        grep -E "(usb|ehci|ohci|xhci|dwc)" snapshots/interrupts_after.txt > /tmp/usb_irq_after.tmp 2>/dev/null || true
+        diff -u /tmp/usb_irq_before.tmp /tmp/usb_irq_after.tmp >> analysis/interrupt_analysis.txt || true
+        rm -f /tmp/usb_irq_*.tmp
+    fi
+    
+    # 2. USB enumeration timeline
+    echo -e "\n--- USB Enumeration Timeline ---"
+    if [ -f timestamps/insertion_time.txt ] && [ -f timestamps/completion_time.txt ]; then
+        INSERTION_TIME=$(cat timestamps/insertion_time.txt | cut -d. -f1)
+        COMPLETION_TIME=$(cat timestamps/completion_time.txt | cut -d. -f1)
+        
+        echo "USB insertion timeline analysis:" > analysis/enumeration_timeline.txt
+        echo "Insertion time: $(cat timestamps/insertion_time.txt)" >> analysis/enumeration_timeline.txt
+        echo "Completion time: $(cat timestamps/completion_time.txt)" >> analysis/enumeration_timeline.txt
+        
+        # Extract events during freeze window
+        echo -e "\n=== Events during freeze window ===" >> analysis/enumeration_timeline.txt
+        
+        # udev events during freeze
+        if [ -f logs/udev_usb_events.log ]; then
+            echo -e "\n--- udev events ---" >> analysis/enumeration_timeline.txt
+            grep -A10 -B5 "$INSERTION_TIME" logs/udev_usb_events.log >> analysis/enumeration_timeline.txt || echo "No udev events found" >> analysis/enumeration_timeline.txt
+        fi
+        
+        # Kernel messages during freeze
+        if [ -f logs/kernel_messages.log ]; then
+            echo -e "\n--- Kernel messages ---" >> analysis/enumeration_timeline.txt
+            grep -A10 -B5 "$INSERTION_TIME" logs/kernel_messages.log >> analysis/enumeration_timeline.txt || echo "No kernel messages found" >> analysis/enumeration_timeline.txt
+        fi
+        
+        # USB enumeration changes
+        if [ -f logs/usb_enumeration.log ]; then
+            echo -e "\n--- USB device enumeration ---" >> analysis/enumeration_timeline.txt
+            grep -A5 -B5 "$INSERTION_TIME" logs/usb_enumeration.log >> analysis/enumeration_timeline.txt || echo "No enumeration data found" >> analysis/enumeration_timeline.txt
+        fi
+    fi
+    
+    # 3. Process blocking analysis
+    echo -e "\n--- Process Blocking Analysis ---"
+    if [ -f logs/blocked_processes.log ]; then
+        echo "Blocked processes during USB insertion:" > analysis/blocked_processes.txt
+        if [ -f timestamps/insertion_time.txt ]; then
+            INSERTION_TIME=$(cat timestamps/insertion_time.txt | cut -d. -f1)
+            grep -A10 -B5 "$INSERTION_TIME" logs/blocked_processes.log >> analysis/blocked_processes.txt || echo "No blocked processes found" >> analysis/blocked_processes.txt
+        else
+            cat logs/blocked_processes.log >> analysis/blocked_processes.txt
+        fi
+    fi
+    
+    # 4. usbmon trace analysis
+    echo -e "\n--- USB Bus Transaction Analysis ---"
+    if [ -f traces/usbmon_all_buses.raw ]; then
+        echo "USB bus transaction summary:" > analysis/usbmon_analysis.txt
+        echo "Total transactions: $(wc -l < traces/usbmon_all_buses.raw)" >> analysis/usbmon_analysis.txt
+        echo -e "\nFirst 50 transactions:" >> analysis/usbmon_analysis.txt
+        head -50 traces/usbmon_all_buses.raw >> analysis/usbmon_analysis.txt
+        echo -e "\nLast 50 transactions:" >> analysis/usbmon_analysis.txt
+        tail -50 traces/usbmon_all_buses.raw >> analysis/usbmon_analysis.txt
+        
+        # Look for specific USB patterns that indicate issues
+        echo -e "\n=== Error/Timeout Patterns ===" >> analysis/usbmon_analysis.txt
+        grep -i -E "(error|timeout|stall|nak)" traces/usbmon_all_buses.raw >> analysis/usbmon_analysis.txt || echo "No error patterns found" >> analysis/usbmon_analysis.txt
+    fi
+    
+    # 5. Interrupt storm detection
+    echo -e "\n--- Interrupt Storm Detection ---"
+    if [ -f logs/interrupt_monitoring.log ]; then
+        echo "Interrupt rate analysis:" > analysis/interrupt_storm.txt
+        
+        # Calculate interrupt rates
+        echo "USB interrupt counts over time:" >> analysis/interrupt_storm.txt
+        grep "USB IRQ lines" logs/interrupt_monitoring.log | tail -20 >> analysis/interrupt_storm.txt
+        
+        # Look for sudden spikes
+        echo -e "\n=== Interrupt Spikes ===" >> analysis/interrupt_storm.txt
+        awk '/USB IRQ lines/ {
+            if (prev != "" && $NF - prev > 10) {
+                print "SPIKE: " $0 " (increase of " ($NF - prev) ")"
+            }
+            prev = $NF
+        }' logs/interrupt_monitoring.log >> analysis/interrupt_storm.txt
+    fi
+    
+    # 6. System load impact
+    echo -e "\n--- System Load Impact ---"
+    if [ -f logs/system_load.log ] && [ -f timestamps/insertion_time.txt ]; then
+        INSERTION_TIME=$(cat timestamps/insertion_time.txt | cut -d. -f1)
+        echo "System load during USB insertion:" > analysis/load_impact.txt
+        grep -A20 -B10 "$INSERTION_TIME" logs/system_load.log >> analysis/load_impact.txt || echo "No load data found" >> analysis/load_impact.txt
+        
+        # Calculate load spikes
+        echo -e "\n=== Load Spikes ===" >> analysis/load_impact.txt
+        awk '/load/ {
+            load = $3
+            if (load > 1.0) {
+                print "HIGH LOAD: " $0
+            }
+        }' logs/system_load.log >> analysis/load_impact.txt
+    fi
+    
+    echo "Analysis complete. Results saved in analysis/ directory"
+}
+
+# ============================================================================
+# GENERATE SUMMARY REPORT
+# ============================================================================
+
+generate_report() {
+    echo "=== Generating Summary Report ==="
+    
+    cat > USB_FREEZE_ANALYSIS_REPORT.txt << 'REPORT_EOF'
+USB Freeze Analysis Report
+==========================
+
+Generated: $(date)
+Analysis Directory: $(pwd)
+
+EXECUTIVE SUMMARY
+-----------------
+This analysis captures comprehensive data about USB device insertion freezes
+on embedded systems using kernel-level monitoring (usbmon) and system profiling.
+
+DIRECTORY STRUCTURE
+-------------------
+- logs/: Real-time monitoring logs
+  - interrupt_monitoring.log: USB interrupt rates and conflicts
+  - blocked_processes.log: Processes in blocked (D) state
+  - usb_enumeration.log: USB device enumeration timeline
+  - udev_usb_events.log: udev events for USB subsystem
+  - kernel_messages.log: Live kernel messages
+  - system_load.log: High-frequency system load monitoring
+
+- traces/: Raw USB bus transaction data
+  - usbmon_all_buses.raw: Complete USB bus traffic capture
+  - usbmon_busN.raw: Individual USB bus captures
+
+- snapshots/: System state before/after USB insertion
+  - interrupts_before/after.txt: Complete interrupt state
+  - meminfo_before/after.txt: Memory usage
+  - processes_before/after.txt: Process list
+  - lsusb_before/after.txt: USB device list
+
+- analysis/: Automated analysis results
+  - interrupt_analysis.txt: IRQ count differences and changes
+  - enumeration_timeline.txt: Event timeline during freeze
+  - blocked_processes.txt: Process blocking analysis
+  - usbmon_analysis.txt: USB transaction analysis
+  - interrupt_storm.txt: IRQ storm detection
+  - load_impact.txt: System load impact analysis
+
+- timestamps/: Precise timing markers
+  - insertion_time.txt: USB device insertion timestamp
+  - completion_time.txt: Freeze completion timestamp
+
+KEY ANALYSIS STEPS
+------------------
+1. Compare snapshots/interrupts_before.txt vs interrupts_after.txt
+   - Look for IRQ count increases
+   - Check for new interrupt lines
+   - Identify IRQ sharing conflicts
+
+2. Review analysis/enumeration_timeline.txt
+   - Timeline of events during freeze window
+   - udev event sequence
+   - Kernel message correlation
+
+3. Examine traces/usbmon_all_buses.raw
+   - Raw USB bus transactions
+   - Look for timeout/error patterns
+   - Analyze enumeration sequence timing
+
+4. Check analysis/blocked_processes.txt
+   - Identify processes stuck in D state
+   - Look for udev/kernel threads blocking
+   - Correlate with interrupt handling
+
+5. Review analysis/interrupt_storm.txt
+   - IRQ rate spikes during insertion
+   - USB controller interrupt behavior
+   - Shared interrupt conflicts
+
+COMMON FREEZE CAUSES TO INVESTIGATE
+-----------------------------------
+1. IRQ Storm: Sudden spike in USB interrupts overwhelming system
+2. Process Blocking: udev or kernel threads stuck waiting for hardware
+3. DMA Coherency: Memory consistency issues on embedded platforms
+4. Power Management: USB controller power state transitions
+5. Driver Synchronization: Module loading or driver initialization delays
+6. Hardware Timing: USB controller enumeration timing issues
+
+DEBUGGING RECOMMENDATIONS
+-------------------------
+Based on analysis results, focus on:
+- Highest IRQ count increases in interrupt analysis
+- Longest blocking times in process analysis
+- Error patterns in usbmon traces
+- Timeline gaps in enumeration sequence
+
+Next steps if issues persist:
+1. Enable USB debugging: echo 'module usbcore +p' > /sys/kernel/debug/dynamic_debug/control
+2. Use function tracing: echo function > /sys/kernel/debug/tracing/current_tracer
+3. Check hardware errata for your USB controller
+4. Test with different USB devices to isolate hardware vs software issues
+
+REPORT_EOF
+
+    # Fill in actual values
+    sed -i "s/\$(date)/$(date)/" USB_FREEZE_ANALYSIS_REPORT.txt
+    sed -i "s/\$(pwd)/$(pwd)/" USB_FREEZE_ANALYSIS_REPORT.txt
+    
+    echo "Report generated: USB_FREEZE_ANALYSIS_REPORT.txt"
+}
+
+# ============================================================================
+# CLEANUP FUNCTION
+# ============================================================================
+
+cleanup() {
+    echo -e "\n=== Cleanup ==="
+    stop_monitoring
+    echo "Analysis complete. Data preserved in: $ANALYSIS_DIR"
+}
+
+trap cleanup EXIT INT TERM
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    echo "=== Embedded USB Freeze Analysis ==="
+    echo "This script uses kernel usbmon and embedded debugging techniques"
+    echo ""
+    
+    # Check if running as root
+    if [ "$EUID" -ne 0 ]; then
+        echo "ERROR: This script must be run as root for full functionality"
+        echo "Run with: sudo $0"
+        exit 1
+    fi
+    
+    # Setup
+    setup_usbmon
+    analyze_usb_controller
+    
+    # Start monitoring
+    start_comprehensive_monitoring
+    
+    # Run insertion test
+    usb_insertion_test
+    
+    # Stop monitoring (handled by cleanup trap)
+    stop_monitoring
+    
+    # Analyze results
+    analyze_results
+    
+    # Generate report
+    generate_report
+    
+    echo ""
+    echo "=== ANALYSIS COMPLETE ==="
+    echo "Results saved in: $ANALYSIS_DIR"
+    echo "Main report: USB_FREEZE_ANALYSIS_REPORT.txt"
+    echo ""
+    echo "Key files to review:"
+    echo "1. USB_FREEZE_ANALYSIS_REPORT.txt - Executive summary"
+    echo "2. analysis/interrupt_analysis.txt - IRQ changes"
+    echo "3. analysis/enumeration_timeline.txt - Event timeline"
+    echo "4. traces/usbmon_all_buses.raw - Raw USB transactions"
+    echo "5. analysis/blocked_processes.txt - Process blocking issues"
+}
+
+# Run main function
+main "$@"

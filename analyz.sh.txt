@@ -1,0 +1,1007 @@
+#!binbash
+
+# USB Monitor Output Analysis Script
+# Analyzes output from the comprehensive USB monitoring script
+
+set -e
+
+if [ $# -ne 1 ]; then
+    echo Usage $0 monitoring_output_directory
+    echo Example $0 tmpusb_monitor_20250126_143022
+    exit 1
+fi
+
+MONITOR_DIR=$1
+ANALYSIS_DIR=${MONITOR_DIR}automated_analysis
+
+if [ ! -d $MONITOR_DIR ]; then
+    echo ERROR Directory $MONITOR_DIR does not exist
+    exit 1
+fi
+
+echo === USB Monitor Output Analysis ===
+echo Input directory $MONITOR_DIR
+echo Analysis output $ANALYSIS_DIR
+echo Timestamp $(date)
+
+# Create analysis directory
+mkdir -p $ANALYSIS_DIR
+cd $ANALYSIS_DIR
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+extract_timestamps() {
+    local logfile=$1
+    local pattern=$2
+    
+    if [ -f $logfile ]; then
+        grep $pattern $logfile  head -1  cut -d'' -f1-3  cut -d' ' -f1
+    fi
+}
+
+calculate_time_diff() {
+    local start_time=$1
+    local end_time=$2
+    
+    if [ -n $start_time ] && [ -n $end_time ]; then
+        start_sec=$(date -d $start_time +%s 2devnull  echo 0)
+        end_sec=$(date -d $end_time +%s 2devnull  echo 0)
+        echo $((end_sec - start_sec))
+    else
+        echo NA
+    fi
+}
+
+# ============================================================================
+# 1. TIMING ANALYSIS
+# ============================================================================
+
+analyze_timing() {
+    echo === TIMING ANALYSIS ===
+    
+    cat  timing_analysis.txt  'EOF'
+USB Insertion Timing Analysis
+=============================
+
+EOF
+    
+    # Extract key timestamps
+    if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+        PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt)
+        echo Pre-insertion timestamp $PRE_TIME  timing_analysis.txt
+    fi
+    
+    if [ -f $MONITOR_DIRtimestampspost_freeze.txt ]; then
+        POST_TIME=$(cat $MONITOR_DIRtimestampspost_freeze.txt)
+        echo Post-freeze timestamp $POST_TIME  timing_analysis.txt
+        
+        if [ -n $PRE_TIME ] && [ -n $POST_TIME ]; then
+            # Calculate freeze duration
+            PRE_SEC=$(echo $PRE_TIME  cut -d. -f1)
+            POST_SEC=$(echo $POST_TIME  cut -d. -f1)
+            FREEZE_DURATION=$(calculate_time_diff $PRE_SEC $POST_SEC)
+            echo Estimated freeze duration ${FREEZE_DURATION} seconds  timing_analysis.txt
+        fi
+    fi
+    
+    echo   timing_analysis.txt
+    echo === Event Timeline Analysis ===  timing_analysis.txt
+    
+    # Analyze load spikes during freeze window
+    if [ -f $MONITOR_DIRsystemloadavg.log ] && [ -n $PRE_TIME ]; then
+        echo -e n--- Load Average During Freeze ---  timing_analysis.txt
+        PRE_TIME_SHORT=$(echo $PRE_TIME  cut -d. -f1)
+        grep -A10 -B5 $PRE_TIME_SHORT $MONITOR_DIRsystemloadavg.log  timing_analysis.txt 2devnull  echo No load data found  timing_analysis.txt
+    fi
+    
+    cat timing_analysis.txt
+}
+
+# ============================================================================
+# 2. INTERRUPT ANALYSIS
+# ============================================================================
+
+analyze_interrupts() {
+    echo -e n=== INTERRUPT ANALYSIS ===
+    
+    cat  interrupt_analysis.txt  'EOF'
+USB Interrupt Analysis
+======================
+
+EOF
+    
+    # Compare beforeafter interrupt counts
+    if [ -f $MONITOR_DIRsnapshotsinterrupts_before.txt ] && [ -f $MONITOR_DIRsnapshotsinterrupts_after.txt ]; then
+        echo === Interrupt Count Changes ===  interrupt_analysis.txt
+        
+        # Extract USB-related interrupts
+        grep -E (usbehciohcixhcidwc) $MONITOR_DIRsnapshotsinterrupts_before.txt  tmpusb_irq_before.tmp 2devnull  touch tmpusb_irq_before.tmp
+        grep -E (usbehciohcixhcidwc) $MONITOR_DIRsnapshotsinterrupts_after.txt  tmpusb_irq_after.tmp 2devnull  touch tmpusb_irq_after.tmp
+        
+        echo -e n--- USB Interrupt Changes ---  interrupt_analysis.txt
+        if [ -s tmpusb_irq_before.tmp ] && [ -s tmpusb_irq_after.tmp ]; then
+            # Calculate interrupt count differences
+            while read line; do
+                irq_num=$(echo $line  awk '{print $1}'  tr -d '')
+                before_count=$(echo $line  awk '{print $2}')
+                after_line=$(grep ^[ ]$irq_num tmpusb_irq_after.tmp  echo )
+                if [ -n $after_line ]; then
+                    after_count=$(echo $after_line  awk '{print $2}')
+                    diff_count=$((after_count - before_count))
+                    desc=$(echo $line  awk '{for(i=4;i=NF;i++) printf %s , $i; print }')
+                    echo IRQ $irq_num +$diff_count interrupts - $desc  interrupt_analysis.txt
+                fi
+            done  tmpusb_irq_before.tmp
+        else
+            echo No USB interrupts found in snapshots  interrupt_analysis.txt
+        fi
+        
+        rm -f tmpusb_irq_.tmp
+    fi
+    
+    # Analyze interrupt storms
+    if [ -f $MONITOR_DIRinterruptsusb_interrupts_detailed.log ]; then
+        echo -e n=== Interrupt Storm Detection ===  interrupt_analysis.txt
+        
+        # Look for high interrupt rates
+        echo High interrupt activity periods  interrupt_analysis.txt
+        awk 'USB IRQ lines active {
+            if ($4  5) {  # More than 5 active IRQ lines might indicate issues
+                print $0
+            }
+        }' $MONITOR_DIRinterruptsusb_interrupts_detailed.log  interrupt_analysis.txt
+        
+        # Check for interrupt count spikes
+        echo -e nInterrupt count spikes  interrupt_analysis.txt
+        awk 'USB IRQ lines active {
+            current = $4
+            if (prev !=  && current - prev  3) {
+                print SPIKE  $0  (increase of  (current - prev) )
+            }
+            prev = current
+        }' $MONITOR_DIRinterruptsusb_interrupts_detailed.log  interrupt_analysis.txt
+    fi
+    
+    cat interrupt_analysis.txt
+}
+
+# ============================================================================
+# 3. PROCESS BLOCKING ANALYSIS
+# ============================================================================
+
+analyze_process_blocking() {
+    echo -e n=== PROCESS BLOCKING ANALYSIS ===
+    
+    cat  process_blocking_analysis.txt  'EOF'
+Process Blocking Analysis
+=========================
+
+EOF
+    
+    if [ -f $MONITOR_DIRprocessesblocked_processes.log ]; then
+        echo === Blocked Processes During USB Insertion ===  process_blocking_analysis.txt
+        
+        # Count blocked processes over time
+        echo -e n--- Blocked Process Count Timeline ---  process_blocking_analysis.txt
+        grep -E ^[0-9]{2}[0-9]{2}[0-9]{2} $MONITOR_DIRprocessesblocked_processes.log  
+        while read timestamp line; do
+            if [ -n $line ]; then
+                count=$(echo $line  wc -l)
+                echo $timestamp $count blocked processes  process_blocking_analysis.txt
+            fi
+        done
+        
+        # Extract specific blocked processes during freeze window
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- Processes Blocked During Freeze Window ---  process_blocking_analysis.txt
+            grep -A20 -B5 $PRE_TIME $MONITOR_DIRprocessesblocked_processes.log  process_blocking_analysis.txt 2devnull  echo No blocked processes during freeze  process_blocking_analysis.txt
+        fi
+        
+        # Identify most commonly blocked processes
+        echo -e n--- Most Frequently Blocked Processes ---  process_blocking_analysis.txt
+        awk '$8 ~ D {print $11}' $MONITOR_DIRprocessesblocked_processes.log  sort  uniq -c  sort -nr  head -10  process_blocking_analysis.txt
+    else
+        echo No blocked processes log found  process_blocking_analysis.txt
+    fi
+    
+    cat process_blocking_analysis.txt
+}
+
+# ============================================================================
+# 4. USB ENUMERATION ANALYSIS
+# ============================================================================
+
+analyze_usb_enumeration() {
+    echo -e n=== USB ENUMERATION ANALYSIS ===
+    
+    cat  usb_enumeration_analysis.txt  'EOF'
+USB Enumeration Analysis
+========================
+
+EOF
+    
+    # Compare device lists beforeafter
+    if [ -f $MONITOR_DIRsnapshotslsusb_before.txt ] && [ -f $MONITOR_DIRsnapshotslsusb_after.txt ]; then
+        echo === USB Device Changes ===  usb_enumeration_analysis.txt
+        
+        echo -e n--- Devices Before Insertion ---  usb_enumeration_analysis.txt
+        cat $MONITOR_DIRsnapshotslsusb_before.txt  usb_enumeration_analysis.txt
+        
+        echo -e n--- Devices After Insertion ---  usb_enumeration_analysis.txt
+        cat $MONITOR_DIRsnapshotslsusb_after.txt  usb_enumeration_analysis.txt
+        
+        echo -e n--- New Devices Added ---  usb_enumeration_analysis.txt
+        diff $MONITOR_DIRsnapshotslsusb_before.txt $MONITOR_DIRsnapshotslsusb_after.txt  grep ^  sed 's^ '  usb_enumeration_analysis.txt  echo No new devices detected  usb_enumeration_analysis.txt
+    fi
+    
+    # Analyze udev events
+    if [ -f $MONITOR_DIRusbudev_events.log ]; then
+        echo -e n=== udev Event Analysis ===  usb_enumeration_analysis.txt
+        
+        # Count udev events
+        echo Total udev events $(wc -l  $MONITOR_DIRusbudev_events.log)  usb_enumeration_analysis.txt
+        
+        # Show addremove events
+        echo -e n--- USB Add Events ---  usb_enumeration_analysis.txt
+        grep ACTION=add $MONITOR_DIRusbudev_events.log  head -10  usb_enumeration_analysis.txt
+        
+        echo -e n--- USB Remove Events ---  usb_enumeration_analysis.txt
+        grep ACTION=remove $MONITOR_DIRusbudev_events.log  head -10  usb_enumeration_analysis.txt
+        
+        # Extract udev event timeline during freeze
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- udev Events During Freeze Window ---  usb_enumeration_analysis.txt
+            grep -A10 -B5 $PRE_TIME $MONITOR_DIRusbudev_events.log  usb_enumeration_analysis.txt 2devnull  echo No udev events during freeze window  usb_enumeration_analysis.txt
+        fi
+    fi
+    
+    cat usb_enumeration_analysis.txt
+}
+
+# ============================================================================
+# 5. UDEV STRACE ANALYSIS
+# ============================================================================
+
+analyze_udev_strace() {
+    echo -e n=== UDEV STRACE ANALYSIS ===
+    
+    cat  udev_strace_analysis.txt  'EOF'
+udev strace Analysis
+====================
+
+EOF
+    
+    if [ -d $MONITOR_DIRusbstrace ]; then
+        echo === udev System Call Analysis ===  udev_strace_analysis.txt
+        
+        # List all strace files
+        echo -e n--- Available strace Files ---  udev_strace_analysis.txt
+        ls -la $MONITOR_DIRusbstrace  udev_strace_analysis.txt
+        
+        # Analyze each strace file
+        for strace_file in $MONITOR_DIRusbstrace.strace; do
+            if [ -f $strace_file ]; then
+                filename=$(basename $strace_file)
+                echo -e n--- Analysis of $filename ---  udev_strace_analysis.txt
+                
+                # Count system calls
+                echo Total system calls $(wc -l  $strace_file)  udev_strace_analysis.txt
+                
+                # Most frequent system calls
+                echo -e nMost frequent system calls  udev_strace_analysis.txt
+                awk -F'(' '{print $1}' $strace_file  awk '{print $NF}'  sort  uniq -c  sort -nr  head -10  udev_strace_analysis.txt
+                
+                # Look for long-running system calls (0.1 seconds)
+                echo -e nLong-running system calls (0.1s)  udev_strace_analysis.txt
+                grep [0-9]+.[1-9] $strace_file  head -10  udev_strace_analysis.txt  echo No long-running calls found  udev_strace_analysis.txt
+                
+                # Look for failed system calls
+                echo -e nFailed system calls  udev_strace_analysis.txt
+                grep = -1 E $strace_file  head -10  udev_strace_analysis.txt  echo No failed calls found  udev_strace_analysis.txt
+                
+                # Look for USB-related file operations
+                echo -e nUSB-related file operations  udev_strace_analysis.txt
+                grep -i -E (usbdev) $strace_file  head -10  udev_strace_analysis.txt  echo No USB file operations found  udev_strace_analysis.txt
+            fi
+        done
+        
+        # Check strace monitor log
+        if [ -f $MONITOR_DIRusbstracestrace_monitor.log ]; then
+            echo -e n--- strace Monitor Log ---  udev_strace_analysis.txt
+            cat $MONITOR_DIRusbstracestrace_monitor.log  udev_strace_analysis.txt
+        fi
+    else
+        echo No strace directory found  udev_strace_analysis.txt
+    fi
+    
+    cat udev_strace_analysis.txt
+}
+
+# ============================================================================
+# 6. MEMORY AND DMA ANALYSIS
+# ============================================================================
+
+analyze_memory_dma() {
+    echo -e n=== MEMORY AND DMA ANALYSIS ===
+    
+    cat  memory_dma_analysis.txt  'EOF'
+Memory and DMA Analysis
+=======================
+
+EOF
+    
+    # Memory usage changes
+    if [ -f $MONITOR_DIRsnapshotsmeminfo_before.txt ] && [ -f $MONITOR_DIRsnapshotsmeminfo_after.txt ]; then
+        echo === Memory Usage Changes ===  memory_dma_analysis.txt
+        
+        # Extract key memory metrics
+        for metric in MemFree MemAvailable Buffers Cached Dirty Writeback; do
+            before=$(grep ^$metric $MONITOR_DIRsnapshotsmeminfo_before.txt  awk '{print $2}')
+            after=$(grep ^$metric $MONITOR_DIRsnapshotsmeminfo_after.txt  awk '{print $2}')
+            if [ -n $before ] && [ -n $after ]; then
+                diff=$((after - before))
+                echo $metric ${before}kB - ${after}kB (${diff}kB change)  memory_dma_analysis.txt
+            fi
+        done
+    fi
+    
+    # DMA analysis
+    if [ -f $MONITOR_DIRmemorydma.log ]; then
+        echo -e n=== DMA Information ===  memory_dma_analysis.txt
+        head -50 $MONITOR_DIRmemorydma.log  memory_dma_analysis.txt
+    fi
+    
+    # Memory pressure analysis
+    if [ -f $MONITOR_DIRmemorymemory_pressure.log ]; then
+        echo -e n=== Memory Pressure During Freeze ===  memory_dma_analysis.txt
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            grep -A10 -B5 $PRE_TIME $MONITOR_DIRmemorymemory_pressure.log  memory_dma_analysis.txt 2devnull  echo No memory pressure data during freeze  memory_dma_analysis.txt
+        fi
+    fi
+    
+    # SLAB allocator analysis
+    if [ -f $MONITOR_DIRmemoryslab.log ]; then
+        echo -e n=== SLAB Allocator Activity ===  memory_dma_analysis.txt
+        tail -50 $MONITOR_DIRmemoryslab.log  memory_dma_analysis.txt
+    fi
+    
+    cat memory_dma_analysis.txt
+}
+
+# ============================================================================
+# 7. MODULE LOADING ANALYSIS
+# ============================================================================
+
+analyze_module_loading() {
+    echo -e n=== MODULE LOADING ANALYSIS ===
+    
+    cat  module_loading_analysis.txt  'EOF'
+Module Loading Analysis
+=======================
+
+EOF
+    
+    if [ -f $MONITOR_DIRmodulesmodule_loading.log ]; then
+        echo === USB Module Loading Timeline ===  module_loading_analysis.txt
+        
+        # Extract module loading events during freeze
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- Modules During Freeze Window ---  module_loading_analysis.txt
+            grep -A10 -B5 $PRE_TIME $MONITOR_DIRmodulesmodule_loading.log  module_loading_analysis.txt 2devnull  echo No module loading activity during freeze  module_loading_analysis.txt
+        fi
+        
+        # Check for module loadingunloading
+        echo -e n--- Module Changes ---  module_loading_analysis.txt
+        tail -50 $MONITOR_DIRmodulesmodule_loading.log  module_loading_analysis.txt
+    fi
+    
+    if [ -f $MONITOR_DIRmodulesmodule_info.log ]; then
+        echo -e n=== USB Module Information ===  module_loading_analysis.txt
+        cat $MONITOR_DIRmodulesmodule_info.log  module_loading_analysis.txt
+    fi
+    
+    cat module_loading_analysis.txt
+}
+
+# ============================================================================
+# 8. KERNEL MESSAGE ANALYSIS
+# ============================================================================
+
+analyze_kernel_messages() {
+    echo -e n=== KERNEL MESSAGE ANALYSIS ===
+    
+    cat  kernel_message_analysis.txt  'EOF'
+Kernel Message Analysis
+=======================
+
+EOF
+    
+    if [ -f $MONITOR_DIRkerneldmesg.log ]; then
+        echo === Kernel Messages During USB Insertion ===  kernel_message_analysis.txt
+        
+        # Extract messages during freeze window
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- Messages During Freeze Window ---  kernel_message_analysis.txt
+            grep -A20 -B5 $PRE_TIME $MONITOR_DIRkerneldmesg.log  kernel_message_analysis.txt 2devnull  echo No kernel messages during freeze window  kernel_message_analysis.txt
+        fi
+        
+        # Look for USB-related messages
+        echo -e n--- USB-Related Kernel Messages ---  kernel_message_analysis.txt
+        grep -i -E (usbehciohcixhcidwc) $MONITOR_DIRkerneldmesg.log  tail -20  kernel_message_analysis.txt  echo No USB-related kernel messages  kernel_message_analysis.txt
+        
+        # Look for errorwarning messages
+        echo -e n--- ErrorWarning Messages ---  kernel_message_analysis.txt
+        grep -i -E (errorwarningfailtimeout) $MONITOR_DIRkerneldmesg.log  tail -10  kernel_message_analysis.txt  echo No errorwarning messages  kernel_message_analysis.txt
+    fi
+    
+    # Lockup detection analysis
+    if [ -f $MONITOR_DIRkernellockup_detection.log ]; then
+        echo -e n=== Lockup Detection ===  kernel_message_analysis.txt
+        tail -50 $MONITOR_DIRkernellockup_detection.log  kernel_message_analysis.txt
+    fi
+    
+    cat kernel_message_analysis.txt
+}
+
+# ============================================================================
+# 9. SYSTEM PERFORMANCE ANALYSIS
+# ============================================================================
+
+analyze_system_performance() {
+    echo -e n=== SYSTEM PERFORMANCE ANALYSIS ===
+    
+    cat  system_performance_analysis.txt  'EOF'
+System Performance Analysis
+===========================
+
+EOF
+    
+    # Load average analysis
+    if [ -f $MONITOR_DIRsystemloadavg.log ]; then
+        echo === Load Average Analysis ===  system_performance_analysis.txt
+        
+        # Find load spikes
+        echo -e n--- Load Spikes (1.0) ---  system_performance_analysis.txt
+        awk '$3  1.0 {print $0}' $MONITOR_DIRsystemloadavg.log  system_performance_analysis.txt  echo No significant load spikes  system_performance_analysis.txt
+        
+        # Load during freeze window
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- Load During Freeze Window ---  system_performance_analysis.txt
+            grep -A10 -B5 $PRE_TIME $MONITOR_DIRsystemloadavg.log  system_performance_analysis.txt 2devnull  echo No load data during freeze  system_performance_analysis.txt
+        fi
+    fi
+    
+    # Real-time load analysis
+    if [ -f $MONITOR_DIRuserspacerealtime_load.log ]; then
+        echo -e n=== High-Frequency Load Analysis ===  system_performance_analysis.txt
+        
+        # Load spikes in high-frequency data
+        awk '$3  0.5 {print $0}' $MONITOR_DIRuserspacerealtime_load.log  head -20  system_performance_analysis.txt  echo No load spikes in high-frequency data  system_performance_analysis.txt
+    fi
+    
+    # CPU statistics
+    if [ -f $MONITOR_DIRsystemcpu_stats.log ]; then
+        echo -e n=== CPU Usage Pattern ===  system_performance_analysis.txt
+        tail -20 $MONITOR_DIRsystemcpu_stats.log  system_performance_analysis.txt
+    fi
+    
+    # Context switches
+    if [ -f $MONITOR_DIRsystemcontext_switches.log ]; then
+        echo -e n=== Context Switch Analysis ===  system_performance_analysis.txt
+        
+        # Look for context switch spikes during freeze
+        if [ -f $MONITOR_DIRtimestampspre_insertion.txt ]; then
+            PRE_TIME=$(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1)
+            echo -e n--- Context Switches During Freeze ---  system_performance_analysis.txt
+            grep -A10 -B5 $PRE_TIME $MONITOR_DIRsystemcontext_switches.log  system_performance_analysis.txt 2devnull  echo No context switch data during freeze  system_performance_analysis.txt
+        fi
+    fi
+    
+    cat system_performance_analysis.txt
+}
+
+# ============================================================================
+# 10. GENERATE COMPREHENSIVE REPORT
+# ============================================================================
+
+generate_comprehensive_report() {
+    echo -e n=== GENERATING COMPREHENSIVE REPORT ===
+    
+    cat  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  'EOF'
+COMPREHENSIVE USB FREEZE ANALYSIS REPORT
+=========================================
+
+Generated $(date)
+Input Directory $(realpath $MONITOR_DIR)
+Analysis Directory $(realpath $ANALYSIS_DIR)
+
+EXECUTIVE SUMMARY
+-----------------
+This report analyzes comprehensive USB insertion monitoring data to identify
+the root cause of USB device insertion freezes.
+
+ANALYSIS SECTIONS
+-----------------
+1. Timing Analysis - Freeze duration and event timeline
+2. Interrupt Analysis - IRQ changes and interrupt storms
+3. Process Blocking - Processes stuck in D state
+4. USB Enumeration - Device detection and udev events
+5. udev strace - System call analysis of udev processes
+6. MemoryDMA - Memory pressure and DMA coherency issues
+7. Module Loading - Kernel module loading delays
+8. Kernel Messages - dmesg output and error analysis
+9. System Performance - Load, CPU, and context switch analysis
+
+KEY FINDINGS SUMMARY
+--------------------
+EOF
+
+    # Fill in current date and paths
+    sed -i s$(date)$(date) COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    sed -i s$(realpath $MONITOR_DIR)$(realpath $MONITOR_DIR) COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    sed -i s$(realpath $ANALYSIS_DIR)$(realpath $ANALYSIS_DIR) COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    
+    # Add key findings from each analysis
+    echo   COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    
+    # Extract key findings from timing analysis
+    if [ -f timing_analysis.txt ]; then
+        echo TIMING FINDINGS  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        grep -E (durationseconds) timing_analysis.txt  head -3  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  echo - No timing data available  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        echo   COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    fi
+    
+    # Extract key findings from interrupt analysis
+    if [ -f interrupt_analysis.txt ]; then
+        echo INTERRUPT FINDINGS  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        grep -E (IRQSPIKEinterrupts) interrupt_analysis.txt  head -5  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  echo - No significant interrupt changes  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        echo   COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    fi
+    
+    # Extract key findings from process blocking
+    if [ -f process_blocking_analysis.txt ]; then
+        echo PROCESS BLOCKING FINDINGS  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        grep -E (blockedprocesses) process_blocking_analysis.txt  head -3  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  echo - No blocked processes detected  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        echo   COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    fi
+    
+    # Extract key findings from USB enumeration
+    if [ -f usb_enumeration_analysis.txt ]; then
+        echo USB ENUMERATION FINDINGS  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        grep -E (Newdevicesevents) usb_enumeration_analysis.txt  head -3  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  echo - Normal USB enumeration  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+        echo   COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+    fi
+    
+    # Add recommendations section
+    cat  COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt  'EOF'
+
+DETAILED ANALYSIS FILES
+-----------------------
+- timing_analysis.txt Freeze duration and timeline
+- interrupt_analysis.txt IRQ changes and storms
+- process_blocking_analysis.txt Blocked process analysis
+- usb_enumeration_analysis.txt USB device enumeration
+- udev_strace_analysis.txt udev system call analysis
+- memory_dma_analysis.txt Memory and DMA analysis
+- module_loading_analysis.txt Kernel module analysis
+- kernel_message_analysis.txt Kernel messages and errors
+- system_performance_analysis.txt System performance metrics
+
+RECOMMENDED NEXT STEPS
+----------------------
+Based on the analysis results
+
+1. Check interrupt_analysis.txt for IRQ storms or conflicts
+2. Review process_blocking_analysis.txt for stuck processes
+3. Examine udev_strace_analysis.txt for hanging system calls
+4. Look at kernel_message_analysis.txt for error messages
+5. Check timing_analysis.txt for freeze duration patterns
+
+If issues persist
+- Enable USB debugging echo 'module usbcore +p'  syskerneldebugdynamic_debugcontrol
+- Use perf to profile during freeze perf record -a -g sleep 10
+- Check hardware documentation for known USB controller issues
+- Test with different USB devices to isolate hardware vs software
+
+DEBUGGING COMMANDS
+------------------
+# Compare interrupt counts
+diff $MONITOR_DIRsnapshotsinterrupts_before.txt $MONITOR_DIRsnapshotsinterrupts_after.txt
+
+# Find events during freeze window
+grep -r $(cat $MONITOR_DIRtimestampspre_insertion.txt  cut -d. -f1) $MONITOR_DIR
+
+# Check for USB-related kernel messages
+grep -i usb $MONITOR_DIRkerneldmesg.log
+
+# Analyze udev system calls
+grep -E (openreadwrite) $MONITOR_DIRusbstrace.strace
+
+EOF
+
+    echo Comprehensive report generated COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt
+}
+
+# ============================================================================
+# 11. ROOT CAUSE IDENTIFICATION
+# ============================================================================
+
+identify_root_cause() {
+    echo -e n=== ROOT CAUSE IDENTIFICATION ===
+    
+    cat  root_cause_analysis.txt  'EOF'
+Root Cause Analysis
+===================
+
+Automated Root Cause Detection Based on Analysis Results
+EOF
+    
+    echo   root_cause_analysis.txt
+    echo === POTENTIAL ROOT CAUSES ===  root_cause_analysis.txt
+    
+    CAUSES_FOUND=0
+    
+    # Check for interrupt storms
+    if [ -f interrupt_analysis.txt ]; then
+        if grep -q SPIKE interrupt_analysis.txt; then
+            echo 1. INTERRUPT STORM DETECTED  root_cause_analysis.txt
+            echo    - USB interrupt spikes found during insertion  root_cause_analysis.txt
+            echo    - This suggests USB controller is generating excessive interrupts  root_cause_analysis.txt
+            echo    - Possible hardware issue or driver bug  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+        
+        # Check for high IRQ increases
+        IRQ_INCREASES=$(grep -E IRQ.+[0-9]+ interrupt_analysis.txt  wc -l)
+        if [ $IRQ_INCREASES -gt 5 ]; then
+            echo 2. HIGH INTERRUPT ACTIVITY  root_cause_analysis.txt
+            echo    - Multiple IRQ lines showing increased activity  root_cause_analysis.txt
+            echo    - May indicate IRQ sharing conflicts or hardware issues  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check for process blocking
+    if [ -f process_blocking_analysis.txt ]; then
+        BLOCKED_PROCESSES=$(grep -c blocked processes process_blocking_analysis.txt  echo 0)
+        if [ $BLOCKED_PROCESSES -gt 3 ]; then
+            echo 3. PROCESS BLOCKING DETECTED  root_cause_analysis.txt
+            echo    - Multiple processes found in blocked (D) state  root_cause_analysis.txt
+            echo    - Processes waiting for IO or hardware response  root_cause_analysis.txt
+            echo    - Check process_blocking_analysis.txt for specific processes  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+        
+        # Check for udev blocking
+        if grep -q udev process_blocking_analysis.txt; then
+            echo 4. UDEV PROCESS BLOCKING  root_cause_analysis.txt
+            echo    - udev processes found in blocked state  root_cause_analysis.txt
+            echo    - USB device enumeration may be hanging  root_cause_analysis.txt
+            echo    - Check udev strace analysis for hanging system calls  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check udev strace for long system calls
+    if [ -f udev_strace_analysis.txt ]; then
+        if grep -q Long-running system calls udev_strace_analysis.txt; then
+            echo 5. SLOW UDEV SYSTEM CALLS  root_cause_analysis.txt
+            echo    - udev processes making slow system calls (0.1s)  root_cause_analysis.txt
+            echo    - Indicates hardware access delays or blocking IO  root_cause_analysis.txt
+            echo    - Review udev_strace_analysis.txt for specific calls  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+        
+        if grep -q Failed system calls udev_strace_analysis.txt; then
+            echo 6. UDEV SYSTEM CALL FAILURES  root_cause_analysis.txt
+            echo    - udev processes encountering failed system calls  root_cause_analysis.txt
+            echo    - May indicate permission issues or hardware problems  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check for memory pressure
+    if [ -f memory_dma_analysis.txt ]; then
+        if grep -q Dirty.[0-9][0-9][0-9][0-9][0-9] memory_dma_analysis.txt; then
+            echo 7. MEMORY PRESSURE DETECTED  root_cause_analysis.txt
+            echo    - High dirty memory pages detected  root_cause_analysis.txt
+            echo    - System may be under memory pressure  root_cause_analysis.txt
+            echo    - Could cause delays in USB processing  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check for module loading delays
+    if [ -f module_loading_analysis.txt ]; then
+        if grep -q module.loading module_loading_analysis.txt; then
+            echo 8. MODULE LOADING ACTIVITY  root_cause_analysis.txt
+            echo    - Kernel modules being loaded during USB insertion  root_cause_analysis.txt
+            echo    - Synchronous module loading can cause delays  root_cause_analysis.txt
+            echo    - Check if modules can be preloaded  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check kernel messages for errors
+    if [ -f kernel_message_analysis.txt ]; then
+        if grep -q -i -E (errortimeoutfail) kernel_message_analysis.txt; then
+            echo 9. KERNEL ERRORS DETECTED  root_cause_analysis.txt
+            echo    - Kernel errortimeout messages during USB insertion  root_cause_analysis.txt
+            echo    - Check kernel_message_analysis.txt for specific errors  root_cause_analysis.txt
+            echo    - May indicate hardware or driver issues  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Check for high system load
+    if [ -f system_performance_analysis.txt ]; then
+        if grep -q Load Spikes system_performance_analysis.txt; then
+            echo 10. HIGH SYSTEM LOAD  root_cause_analysis.txt
+            echo     - System load spikes detected during USB insertion  root_cause_analysis.txt
+            echo     - High load can cause scheduling delays  root_cause_analysis.txt
+            echo     - Check what processes are consuming CPU  root_cause_analysis.txt
+            echo   root_cause_analysis.txt
+            CAUSES_FOUND=$((CAUSES_FOUND + 1))
+        fi
+    fi
+    
+    # Summary
+    echo === ROOT CAUSE SUMMARY ===  root_cause_analysis.txt
+    if [ $CAUSES_FOUND -eq 0 ]; then
+        echo No obvious root causes detected in automated analysis.  root_cause_analysis.txt
+        echo The freeze may be caused by  root_cause_analysis.txt
+        echo - Hardware-level USB controller delays  root_cause_analysis.txt
+        echo - Timing issues in USB enumeration sequence  root_cause_analysis.txt
+        echo - Driver synchronization issues not visible in logs  root_cause_analysis.txt
+        echo   root_cause_analysis.txt
+        echo Recommendations  root_cause_analysis.txt
+        echo 1. Enable more detailed USB debugging  root_cause_analysis.txt
+        echo 2. Use hardware USB analyzer if available  root_cause_analysis.txt
+        echo 3. Test with different USB devices  root_cause_analysis.txt
+        echo 4. Check USB controller errata documentation  root_cause_analysis.txt
+    else
+        echo Found $CAUSES_FOUND potential root causes.  root_cause_analysis.txt
+        echo Focus investigation on the causes listed above.  root_cause_analysis.txt
+        echo   root_cause_analysis.txt
+        echo Priority order for investigation  root_cause_analysis.txt
+        if grep -q INTERRUPT STORM root_cause_analysis.txt; then
+            echo 1. Interrupt storms (highest priority)  root_cause_analysis.txt
+        fi
+        if grep -q UDEV.BLOCKING root_cause_analysis.txt; then
+            echo 2. udev process blocking (high priority)  root_cause_analysis.txt
+        fi
+        if grep -q KERNEL ERRORS root_cause_analysis.txt; then
+            echo 3. Kernel errors (high priority)  root_cause_analysis.txt
+        fi
+        if grep -q PROCESS BLOCKING root_cause_analysis.txt; then
+            echo 4. General process blocking (medium priority)  root_cause_analysis.txt
+        fi
+        if grep -q SYSTEM CALL root_cause_analysis.txt; then
+            echo 5. Slow udev system calls (medium priority)  root_cause_analysis.txt
+        fi
+    fi
+    
+    cat root_cause_analysis.txt
+}
+
+# ============================================================================
+# 12. GENERATE ACTION PLAN
+# ============================================================================
+
+generate_action_plan() {
+    echo -e n=== GENERATING ACTION PLAN ===
+    
+    cat  action_plan.txt  'EOF'
+USB Freeze Debugging Action Plan
+================================
+
+Based on the comprehensive analysis, here are the recommended next steps
+
+IMMEDIATE ACTIONS
+-----------------
+EOF
+    
+    # Generate specific actions based on findings
+    if [ -f root_cause_analysis.txt ]; then
+        if grep -q INTERRUPT STORM root_cause_analysis.txt; then
+            cat  action_plan.txt  'EOF'
+
+1. INTERRUPT STORM INVESTIGATION
+   Commands to run
+   - cat procinterrupts  grep -E (usbehciohcixhcidwc)
+   - echo 'func=set_debug_level  level = all'  syskerneldebugdynamic_debugcontrol
+   - Check USB controller sharing interrupts cat procinterrupts  grep $(cat procinterrupts  grep -E (usbehciohcixhcidwc)  awk '{print $1}'  tr -d '')
+   
+   Hardware checks
+   - Review USB controller documentation for interrupt handling
+   - Check if USB controller shares interrupts with other critical devices
+   - Consider interrupt affinity echo 2  procirqXXsmp_affinity
+EOF
+        fi
+        
+        if grep -q UDEV.BLOCKINGPROCESS BLOCKING root_cause_analysis.txt; then
+            cat  action_plan.txt  'EOF'
+
+2. PROCESS BLOCKING INVESTIGATION
+   Commands to run
+   - echo t  procsysrq-trigger  # Dump all tasks (check dmesg)
+   - perf record -a -g -e 'syscallssys_enter_' sleep 10  # During USB insertion
+   - strace -f -e trace=all $(pgrep udevd) 2&1  grep -E (readwriteopenioctl)
+   
+   Configuration checks
+   - Check udev rules grep -r USB etcudevrules.d
+   - Check systemd-udevd configuration systemctl cat systemd-udevd
+   - Test with minimal udev rules mv etcudevrules.d etcudevrules.d.backup
+EOF
+        fi
+        
+        if grep -q KERNEL ERRORS root_cause_analysis.txt; then
+            cat  action_plan.txt  'EOF'
+
+3. KERNEL ERROR INVESTIGATION
+   Commands to run
+   - dmesg  grep -i -E (usberrortimeoutfail)  tail -20
+   - echo 'module usbcore +p'  syskerneldebugdynamic_debugcontrol
+   - echo 'module ehci_hcd +p'  syskerneldebugdynamic_debugcontrol
+   - echo 'module xhci_hcd +p'  syskerneldebugdynamic_debugcontrol
+   
+   Advanced debugging
+   - echo function  syskerneldebugtracingcurrent_tracer
+   - echo 'usb'  syskerneldebugtracingset_ftrace_filter
+   - echo 1  syskerneldebugtracingtracing_on
+EOF
+        fi
+    fi
+    
+    cat  action_plan.txt  'EOF'
+
+SYSTEMATIC DEBUGGING APPROACH
+------------------------------
+
+Phase 1 Reproduce with Minimal System
+- Boot with minimal kernel modules
+- Test USB insertion without udev rules
+- Use basic drivers only (no custom configurations)
+
+Phase 2 Hardware-Level Analysis
+- Use USB protocol analyzer if available
+- Test different USB ports and devices
+- Check USB controller registers lspci -xxx -s $(lspci  grep -i usb  cut -d' ' -f1)
+
+Phase 3 Driver-Level Analysis
+- Enable all USB debugging in kernel config
+- Use function tracing for USB subsystem
+- Profile with perf during USB insertion
+
+Phase 4 Timing Analysis
+- Use high-resolution timers rdtsc or clock_gettime
+- Measure each phase of USB enumeration
+- Compare timing with working systems
+
+CONFIGURATION TESTS
+--------------------
+
+Test 1 Disable USB autosuspend
+echo -1  sysmoduleusbcoreparametersautosuspend
+
+Test 2 Increase USB enumeration timeouts
+echo 10000  sysmoduleusbcoreparametersold_scheme_first
+
+Test 3 Disable USB power management
+echo on  sysbususbdevicespowercontrol
+
+Test 4 Force USB 2.0 mode (if using USB 3.0)
+echo Y  sysmodulexhci_hcdparametersxhci_force_2_0
+
+MONITORING DURING TESTS
+-----------------------
+
+Set up continuous monitoring
+- while true; do echo $(date) $(cat procloadavg); sleep 0.1; done &
+- dmesg -w &
+- cat syskerneldebugusbusbmon0u &
+- top -d 0.1 &
+
+ESCALATION CRITERIA
+-------------------
+
+Contact hardware vendor if
+- Issue persists across different kernel versions
+- Multiple USB devices show same behavior
+- Hardware documentation shows known issues
+- Problem occurs on multiple identical systems
+
+Contact kernel developers if
+- Issue is reproducible with mainline kernel
+- Problem appears after specific kernel version
+- USB debugging shows protocol violations
+- Issue affects multiple embedded platforms
+
+DOCUMENTATION
+-------------
+
+For each test, document
+- Exact kernel version and configuration
+- Hardware platform and USB controller type
+- USB device details (lsusb -v output)
+- Timing measurements and freeze duration
+- Any error messages or unusual behavior
+
+Save all debugging output for correlation analysis.
+EOF
+
+    cat action_plan.txt
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    echo Starting comprehensive analysis of USB monitoring data...
+    
+    # Run all analysis functions
+    analyze_timing
+    analyze_interrupts
+    analyze_process_blocking  
+    analyze_usb_enumeration
+    analyze_udev_strace
+    analyze_memory_dma
+    analyze_module_loading
+    analyze_kernel_messages
+    analyze_system_performance
+    
+    # Generate comprehensive report
+    generate_comprehensive_report
+    
+    # Identify root causes
+    identify_root_cause
+    
+    # Generate action plan
+    generate_action_plan
+    
+    echo 
+    echo === ANALYSIS COMPLETE ===
+    echo Analysis results saved in $ANALYSIS_DIR
+    echo 
+    echo Key files generated
+    echo 1. COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt - Main report
+    echo 2. root_cause_analysis.txt - Automated root cause detection
+    echo 3. action_plan.txt - Recommended debugging steps
+    echo 
+    echo Individual analysis files
+    ls -1 $ANALYSIS_DIR.txt  grep -v COMPREHENSIVEroot_causeaction_plan  while read file; do
+        echo - $(basename $file)
+    done
+    echo 
+    echo Review the COMPREHENSIVE_USB_FREEZE_ANALYSIS.txt file first for an overview,
+    echo then check root_cause_analysis.txt for potential causes and action_plan.txt
+    echo for specific debugging steps.
+}
+
+# Check if running with valid directory
+if [ ! -f $MONITOR_DIRanalysis_summary.txt ]; then
+    echo WARNING Input directory may not be from the USB monitoring script
+    echo Expected to find analysis_summary.txt in the directory
+    echo Continuing anyway...
+fi
+
+# Run main analysis
+main $@

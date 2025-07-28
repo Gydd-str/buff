@@ -1,0 +1,480 @@
+#!/bin/bash
+
+# USB Freeze Analysis Script
+# Analyzes output from usb.sh monitoring script to identify freeze causes
+
+set -e
+
+# Check if monitor directory is provided
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <monitor_directory>"
+    echo "Example: $0 /tmp/usb_monitor_20241215_143052"
+    exit 1
+fi
+
+MONITOR_DIR="$1"
+if [ ! -d "$MONITOR_DIR" ]; then
+    echo "Error: Monitor directory '$MONITOR_DIR' not found"
+    exit 1
+fi
+
+cd "$MONITOR_DIR"
+
+ANALYSIS_DIR="analysis_results"
+mkdir -p "$ANALYSIS_DIR"
+
+echo "=== USB Freeze Analysis Starting ==="
+echo "Monitor directory: $MONITOR_DIR"
+echo "Analysis results: $ANALYSIS_DIR"
+echo ""
+
+# Get timing information
+if [ -f timestamps/pre_insertion.txt ]; then
+    PRE_TIME=$(cat timestamps/pre_insertion.txt | cut -d: -f2-3 | cut -d. -f1)
+    PRE_TIME_FULL=$(cat timestamps/pre_insertion.txt)
+    echo "Pre-insertion timestamp: $PRE_TIME_FULL"
+else
+    echo "Warning: Pre-insertion timestamp not found"
+    PRE_TIME=""
+fi
+
+if [ -f timestamps/post_freeze.txt ]; then
+    POST_TIME=$(cat timestamps/post_freeze.txt | cut -d: -f2-3 | cut -d. -f1)
+    POST_TIME_FULL=$(cat timestamps/post_freeze.txt)
+    echo "Post-freeze timestamp: $POST_TIME_FULL"
+else
+    echo "Warning: Post-freeze timestamp not found"
+    POST_TIME=""
+fi
+
+echo ""
+
+# ============================================================================
+# INTERRUPT ANALYSIS
+# ============================================================================
+
+analyze_interrupts() {
+    echo "=== INTERRUPT ANALYSIS ==="
+    
+    if [ -f snapshots/interrupts_before.txt ] && [ -f snapshots/interrupts_after.txt ]; then
+        echo "Comparing interrupt counts before/after USB insertion..."
+        
+        # Calculate interrupt count differences
+        cat > "$ANALYSIS_DIR/interrupt_analysis.txt" << 'EOF'
+USB Insertion Interrupt Analysis
+================================
+
+EOF
+        
+        # Find USB-related interrupt changes
+        echo "USB-Related Interrupt Changes:" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+        echo "=============================" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+        
+        # Extract USB interrupt lines and compare counts
+        for file in snapshots/interrupts_before.txt snapshots/interrupts_after.txt; do
+            grep -i -E "(usb|ehci|ohci|xhci|dwc)" "$file" > "${file}.usb" 2>/dev/null || touch "${file}.usb"
+        done
+        
+        # Compare USB interrupt counts
+        if [ -s snapshots/interrupts_before.txt.usb ] && [ -s snapshots/interrupts_after.txt.usb ]; then
+            echo "Before USB insertion:" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            cat snapshots/interrupts_before.txt.usb >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            echo "" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            echo "After USB insertion:" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            cat snapshots/interrupts_after.txt.usb >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            echo "" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            
+            # Calculate differences
+            echo "Interrupt Count Changes:" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            echo "=======================" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+            
+            join -1 1 -2 1 -o 1.1,1.2,2.2 \
+                <(awk '{print $1, $2}' snapshots/interrupts_before.txt.usb | sort) \
+                <(awk '{print $1, $2}' snapshots/interrupts_after.txt.usb | sort) | \
+            while read irq before after; do
+                if [ "$before" != "$after" ]; then
+                    diff=$((after - before))
+                    echo "IRQ $irq: $before -> $after (diff: +$diff)" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+                fi
+            done
+        else
+            echo "No USB interrupts found in snapshots" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+        fi
+        
+        # Check for interrupt storms
+        echo "" >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+        echo "Checking for interrupt storms during freeze window..." >> "$ANALYSIS_DIR/interrupt_analysis.txt"
+        
+        if [ -f interrupts/usb_interrupts_detailed.log ] && [ -n "$PRE_TIME" ]; then
+            # Look for rapid interrupt increases around insertion time
+            grep -A20 -B5 "$PRE_TIME" interrupts/usb_interrupts_detailed.log > "$ANALYSIS_DIR/irq_storm_check.txt" 2>/dev/null || \
+                echo "No interrupt data found for freeze window" > "$ANALYSIS_DIR/irq_storm_check.txt"
+        fi
+        
+        echo "✓ Interrupt analysis complete"
+    else
+        echo "⚠ Warning: Interrupt snapshots not found"
+    fi
+}
+
+# ============================================================================
+# PROCESS AND SYSTEM STATE ANALYSIS
+# ============================================================================
+
+analyze_processes() {
+    echo "=== PROCESS ANALYSIS ==="
+    
+    # Find blocked processes during freeze
+    if [ -f processes/blocked_processes.log ] && [ -n "$PRE_TIME" ]; then
+        echo "Analyzing blocked processes during freeze window..."
+        
+        # Extract processes that were blocked around insertion time
+        grep -A10 -B5 "$PRE_TIME" processes/blocked_processes.log > "$ANALYSIS_DIR/blocked_during_freeze.txt" 2>/dev/null || \
+            echo "No blocked process data found for freeze window" > "$ANALYSIS_DIR/blocked_during_freeze.txt"
+        
+        # Count blocked processes over time
+        cat > "$ANALYSIS_DIR/blocked_process_timeline.txt" << 'EOF'
+Blocked Process Timeline
+========================
+
+EOF
+        if [ -f processes/blocked_processes.log ]; then
+            grep "===" processes/blocked_processes.log | while read timestamp; do
+                count=$(grep -A20 "$timestamp" processes/blocked_processes.log | grep -v "===" | grep -c "^[a-zA-Z]" || echo "0")
+                echo "$timestamp: $count blocked processes" >> "$ANALYSIS_DIR/blocked_process_timeline.txt"
+            done
+        fi
+        echo "✓ Process analysis complete"
+    else
+        echo "⚠ Warning: Blocked process logs not found"
+    fi
+    
+    # Analyze load average spikes
+    if [ -f userspace/realtime_load.log ]; then
+        echo "Analyzing load average spikes..."
+        
+        # Find peak load values
+        awk '{print $2}' userspace/realtime_load.log | sort -nr | head -10 > "$ANALYSIS_DIR/peak_loads.txt"
+        
+        # Find load spikes around insertion time
+        if [ -n "$PRE_TIME" ]; then
+            grep -A30 -B10 "$PRE_TIME" userspace/realtime_load.log > "$ANALYSIS_DIR/load_during_freeze.txt" 2>/dev/null || \
+                echo "No load data found for freeze window" > "$ANALYSIS_DIR/load_during_freeze.txt"
+        fi
+        echo "✓ Load analysis complete"
+    fi
+}
+
+# ============================================================================
+# USB SUBSYSTEM ANALYSIS
+# ============================================================================
+
+analyze_usb() {
+    echo "=== USB SUBSYSTEM ANALYSIS ==="
+    
+    # Analyze udev events
+    if [ -f usb/udev_events.log ]; then
+        echo "Analyzing udev event timeline..."
+        
+        cat > "$ANALYSIS_DIR/udev_timeline.txt" << 'EOF'
+udev Event Timeline Analysis
+============================
+
+EOF
+        # Extract events around insertion time
+        if [ -n "$PRE_TIME" ]; then
+            grep -A50 -B10 "$PRE_TIME" usb/udev_events.log >> "$ANALYSIS_DIR/udev_timeline.txt" 2>/dev/null || \
+                echo "No udev events found for freeze window" >> "$ANALYSIS_DIR/udev_timeline.txt"
+        else
+            echo "Full udev event log (last 100 events):" >> "$ANALYSIS_DIR/udev_timeline.txt"
+            tail -100 usb/udev_events.log >> "$ANALYSIS_DIR/udev_timeline.txt" 2>/dev/null || \
+                echo "No udev events found" >> "$ANALYSIS_DIR/udev_timeline.txt"
+        fi
+        echo "✓ udev analysis complete"
+    fi
+    
+    # Analyze USB device enumeration
+    if [ -f snapshots/lsusb_before.txt ] && [ -f snapshots/lsusb_after.txt ]; then
+        echo "Analyzing USB device enumeration..."
+        
+        echo "USB Device Changes:" > "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "==================" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "Before insertion:" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        cat snapshots/lsusb_before.txt >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "After insertion:" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        cat snapshots/lsusb_after.txt >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        echo "New devices:" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        diff snapshots/lsusb_before.txt snapshots/lsusb_after.txt | grep "^>" >> "$ANALYSIS_DIR/usb_device_changes.txt" || \
+            echo "No new devices detected" >> "$ANALYSIS_DIR/usb_device_changes.txt"
+        
+        echo "✓ USB enumeration analysis complete"
+    fi
+    
+    # Analyze strace data for udev delays
+    if [ -d usb/strace ]; then
+        echo "Analyzing udev system call delays..."
+        
+        cat > "$ANALYSIS_DIR/udev_strace_analysis.txt" << 'EOF'
+udev strace Analysis
+====================
+
+EOF
+        for strace_file in usb/strace/*.strace; do
+            if [ -f "$strace_file" ]; then
+                echo "=== $(basename $strace_file) ===" >> "$ANALYSIS_DIR/udev_strace_analysis.txt"
+                
+                # Find slow system calls (>100ms)
+                grep " <[0-9]*\.[1-9]" "$strace_file" | head -20 >> "$ANALYSIS_DIR/udev_strace_analysis.txt" 2>/dev/null || \
+                    echo "No slow system calls found" >> "$ANALYSIS_DIR/udev_strace_analysis.txt"
+                echo "" >> "$ANALYSIS_DIR/udev_strace_analysis.txt"
+            fi
+        done
+        echo "✓ strace analysis complete"
+    fi
+}
+
+# ============================================================================
+# KERNEL AND MODULE ANALYSIS
+# ============================================================================
+
+analyze_kernel() {
+    echo "=== KERNEL ANALYSIS ==="
+    
+    # Analyze dmesg output
+    if [ -f kernel/dmesg.log ]; then
+        echo "Analyzing kernel messages..."
+        
+        # Extract messages around insertion time
+        if [ -n "$PRE_TIME" ]; then
+            grep -A30 -B10 "$PRE_TIME" kernel/dmesg.log > "$ANALYSIS_DIR/dmesg_during_freeze.txt" 2>/dev/null
+        fi
+        
+        # Look for error messages
+        grep -i -E "(error|fail|timeout|stall|lockup|rcu)" kernel/dmesg.log > "$ANALYSIS_DIR/kernel_errors.txt" 2>/dev/null || \
+            echo "No kernel errors found" > "$ANALYSIS_DIR/kernel_errors.txt"
+        
+        # Look for USB-specific messages
+        grep -i usb kernel/dmesg.log > "$ANALYSIS_DIR/kernel_usb_messages.txt" 2>/dev/null || \
+            echo "No USB kernel messages found" > "$ANALYSIS_DIR/kernel_usb_messages.txt"
+        
+        echo "✓ Kernel message analysis complete"
+    fi
+    
+    # Analyze module loading
+    if [ -f modules/module_loading.log ]; then
+        echo "Analyzing module loading patterns..."
+        
+        # Look for modules loaded around insertion time
+        if [ -n "$PRE_TIME" ]; then
+            grep -A20 -B10 "$PRE_TIME" modules/module_loading.log > "$ANALYSIS_DIR/modules_during_freeze.txt" 2>/dev/null || \
+                echo "No module loading data found for freeze window" > "$ANALYSIS_DIR/modules_during_freeze.txt"
+        fi
+        echo "✓ Module analysis complete"
+    fi
+    
+    # Check for lockups
+    if [ -f kernel/lockup_detection.log ]; then
+        echo "Checking for system lockups..."
+        
+        grep -i -E "(lockup|stall|rcu)" kernel/lockup_detection.log > "$ANALYSIS_DIR/lockup_detection.txt" 2>/dev/null || \
+            echo "No lockups detected" > "$ANALYSIS_DIR/lockup_detection.txt"
+        echo "✓ Lockup analysis complete"
+    fi
+}
+
+# ============================================================================
+# MEMORY AND I/O ANALYSIS
+# ============================================================================
+
+analyze_memory_io() {
+    echo "=== MEMORY AND I/O ANALYSIS ==="
+    
+    # Memory usage analysis
+    if [ -f snapshots/meminfo_before.txt ] && [ -f snapshots/meminfo_after.txt ]; then
+        echo "Analyzing memory usage changes..."
+        
+        echo "Memory Usage Changes:" > "$ANALYSIS_DIR/memory_analysis.txt"
+        echo "====================" >> "$ANALYSIS_DIR/memory_analysis.txt"
+        echo "" >> "$ANALYSIS_DIR/memory_analysis.txt"
+        
+        # Compare key memory metrics
+        for metric in MemFree MemAvailable Cached Buffers Dirty Writeback; do
+            before=$(grep "^$metric:" snapshots/meminfo_before.txt | awk '{print $2}' 2>/dev/null || echo "0")
+            after=$(grep "^$metric:" snapshots/meminfo_after.txt | awk '{print $2}' 2>/dev/null || echo "0")
+            
+            if [ "$before" != "0" ] && [ "$after" != "0" ]; then
+                diff=$((after - before))
+                echo "$metric: $before -> $after (diff: $diff kB)" >> "$ANALYSIS_DIR/memory_analysis.txt"
+            fi
+        done
+        echo "✓ Memory analysis complete"
+    fi
+    
+    # DMA analysis
+    if [ -f memory/dma.log ]; then
+        echo "Analyzing DMA usage..."
+        
+        if [ -n "$PRE_TIME" ]; then
+            grep -A10 -B5 "$PRE_TIME" memory/dma.log > "$ANALYSIS_DIR/dma_during_freeze.txt" 2>/dev/null || \
+                echo "No DMA data found for freeze window" > "$ANALYSIS_DIR/dma_during_freeze.txt"
+        fi
+        echo "✓ DMA analysis complete"
+    fi
+    
+    # I/O analysis
+    if [ -f io/diskstats.log ]; then
+        echo "Analyzing I/O patterns..."
+        
+        if [ -n "$PRE_TIME" ]; then
+            grep -A10 -B5 "$PRE_TIME" io/diskstats.log > "$ANALYSIS_DIR/io_during_freeze.txt" 2>/dev/null || \
+                echo "No I/O data found for freeze window" > "$ANALYSIS_DIR/io_during_freeze.txt"
+        fi
+        echo "✓ I/O analysis complete"
+    fi
+}
+
+# ============================================================================
+# MAIN ANALYSIS EXECUTION
+# ============================================================================
+
+echo "Starting comprehensive analysis..."
+echo ""
+
+analyze_interrupts
+analyze_processes  
+analyze_usb
+analyze_kernel
+analyze_memory_io
+
+# ============================================================================
+# GENERATE COMPREHENSIVE REPORT
+# ============================================================================
+
+generate_report() {
+    echo "=== GENERATING COMPREHENSIVE REPORT ==="
+    
+    REPORT_FILE="$ANALYSIS_DIR/comprehensive_analysis_report.txt"
+    
+    cat > "$REPORT_FILE" << EOF
+USB Insertion Freeze Analysis Report
+====================================
+Generated: $(date)
+Monitor Directory: $MONITOR_DIR
+Analysis Directory: $ANALYSIS_DIR
+
+Timing Information:
+- Pre-insertion: $PRE_TIME_FULL
+- Post-freeze: $POST_TIME_FULL
+
+EXECUTIVE SUMMARY
+=================
+
+EOF
+
+    # Add findings summary
+    echo "Key Findings:" >> "$REPORT_FILE"
+    echo "=============" >> "$REPORT_FILE"
+    
+    # Check for common freeze causes
+    FINDINGS=0
+    
+    # Check for interrupt storms
+    if [ -f "$ANALYSIS_DIR/interrupt_analysis.txt" ]; then
+        if grep -q "diff: +[1-9][0-9][0-9]" "$ANALYSIS_DIR/interrupt_analysis.txt"; then
+            echo "⚠ INTERRUPT STORM: Significant interrupt count increases detected" >> "$REPORT_FILE"
+            FINDINGS=$((FINDINGS + 1))
+        fi
+    fi
+    
+    # Check for blocked processes
+    if [ -f "$ANALYSIS_DIR/blocked_during_freeze.txt" ]; then
+        if [ -s "$ANALYSIS_DIR/blocked_during_freeze.txt" ] && grep -q "[a-zA-Z]" "$ANALYSIS_DIR/blocked_during_freeze.txt"; then
+            echo "⚠ PROCESS BLOCKING: Processes blocked during freeze window" >> "$REPORT_FILE"  
+            FINDINGS=$((FINDINGS + 1))
+        fi
+    fi
+    
+    # Check for kernel errors
+    if [ -f "$ANALYSIS_DIR/kernel_errors.txt" ]; then
+        if [ -s "$ANALYSIS_DIR/kernel_errors.txt" ] && grep -q "[a-zA-Z]" "$ANALYSIS_DIR/kernel_errors.txt"; then
+            echo "⚠ KERNEL ERRORS: Error messages found in kernel log" >> "$REPORT_FILE"
+            FINDINGS=$((FINDINGS + 1))
+        fi
+    fi
+    
+    # Check for lockups
+    if [ -f "$ANALYSIS_DIR/lockup_detection.txt" ]; then
+        if [ -s "$ANALYSIS_DIR/lockup_detection.txt" ] && grep -q -i -E "(lockup|stall)" "$ANALYSIS_DIR/lockup_detection.txt"; then
+            echo "⚠ SYSTEM LOCKUP: RCU stalls or lockups detected" >> "$ANALYSIS_DIR"
+            FINDINGS=$((FINDINGS + 1))
+        fi
+    fi
+    
+    # Check for high load
+    if [ -f "$ANALYSIS_DIR/peak_loads.txt" ]; then
+        PEAK_LOAD=$(head -1 "$ANALYSIS_DIR/peak_loads.txt" 2>/dev/null || echo "0")
+        if awk "BEGIN{exit($PEAK_LOAD > 4) ? 0 : 1}"; then
+            echo "⚠ HIGH LOAD: Peak load average of $PEAK_LOAD detected" >> "$REPORT_FILE"
+            FINDINGS=$((FINDINGS + 1))
+        fi
+    fi
+    
+    if [ $FINDINGS -eq 0 ]; then
+        echo "✓ No obvious freeze causes detected in analysis" >> "$REPORT_FILE"
+        echo "  - This may indicate a subtle timing issue or hardware-specific problem" >> "$REPORT_FILE"
+        echo "  - Review detailed logs for patterns" >> "$REPORT_FILE"
+    fi
+    
+    cat >> "$REPORT_FILE" << 'EOF'
+
+RECOMMENDED ACTIONS
+==================
+
+1. Review detailed analysis files in the analysis_results/ directory
+2. Check interrupt_analysis.txt for IRQ conflicts or storms
+3. Examine udev_timeline.txt for enumeration delays
+4. Look at blocked_during_freeze.txt for processes waiting on I/O
+5. Check kernel_errors.txt for hardware or driver issues
+6. Review udev_strace_analysis.txt for userspace delays
+
+DETAILED ANALYSIS FILES
+======================
+
+EOF
+    
+    # List all analysis files with descriptions
+    for file in "$ANALYSIS_DIR"/*.txt; do
+        if [ -f "$file" ]; then
+            filename=$(basename "$file")
+            echo "- $filename: $(head -1 "$file" 2>/dev/null | grep -E '^[A-Z].*' || echo 'Analysis data')" >> "$REPORT_FILE"
+        fi
+    done
+    
+    echo "" >> "$REPORT_FILE"
+    echo "End of Report" >> "$REPORT_FILE"
+    
+    echo "✓ Comprehensive report generated: $REPORT_FILE"
+}
+
+generate_report
+
+echo ""
+echo "=== ANALYSIS COMPLETE ==="
+echo ""
+echo "Results saved in: $ANALYSIS_DIR/"
+echo "Main report: $ANALYSIS_DIR/comprehensive_analysis_report.txt"
+echo ""
+echo "Quick summary:"
+if [ -f "$ANALYSIS_DIR/comprehensive_analysis_report.txt" ]; then
+    grep -A20 "Key Findings:" "$ANALYSIS_DIR/comprehensive_analysis_report.txt" 2>/dev/null || echo "Review full report for details"
+fi
+
+echo ""
+echo "Next steps:"
+echo "1. Review the comprehensive report"
+echo "2. Examine specific analysis files for detailed data"
+echo "3. Look for patterns in the timeline around freeze window"
+echo "4. Consider hardware-specific factors if no obvious software cause found"
